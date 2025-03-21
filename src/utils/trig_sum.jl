@@ -198,7 +198,7 @@ end
 # --- The trig_sum Function ---
 
 """
-    trig_sum(t, h, df, N; f0=0, freq_factor=1, oversampling=5,
+trig_sum(x, y, df, N; f0=0, freq_factor=1,
              use_fft=true, Mfft=4, eps=5e-13)
 
 Compute weighted sine and cosine sums for frequencies
@@ -207,34 +207,33 @@ Compute weighted sine and cosine sums for frequencies
 
 That is, compute
 
-    S[j] = ∑ᵢ h[i] sin(2π f[j] t[i])
-    C[j] = ∑ᵢ h[i] cos(2π f[j] t[i])
+    S[j] = ∑ᵢ y[i] sin(2π f[j] x[i])
+    C[j] = ∑ᵢ y[i] cos(2π f[j] x[i])
 
 When using the FFT-based method, this is achieved via an approximate NUDFT.
 """
-function trig_sum(t::Vector{T}, h::Vector{T}, df::T, N::Int;
+function trig_sum(x::Vector{T}, y::Vector{T}, df::T, N::Int;
                   f0::T=zero(T), freq_factor::T=one(T),
-                  oversampling::Float64=5.0, use_fft::Bool=true,
-                  eps::T=5e-13) where {T<:Real}
+                  use_fft::Bool=true, eps::T=5e-13) where {T<:Real}
     if df <= 0
         error("df must be positive")
     end
     df *= freq_factor
     f0 *= freq_factor
 
-    # Ensure h is complex if using FFT
+    # Ensure y is complex if using FFT
     #if use_fft && !(T <: Complex)
-    #    h = complex.(h)
+    #    y = complex.(y)
     #end
 
     if use_fft
-        t0 = minimum(t)
+        t0 = minimum(x)
 
         if f0 != 0
-            h = h .* exp.(2im * π * f0 .* (t .- t0))
+            y = y .* exp.(2im * π * f0 .* (x .- t0))
         end
-        tnorm = (t .- t0) .* df
-        local fftgrid = nufft1_lra(tnorm, h, N, eps)
+        tnorm = (x .- t0) .* df
+        local fftgrid = nufft1_lra(tnorm, y, N, eps)
         if t0 > 0
             local f = f0 .+ df .* (0:N-1)
             fftgrid = fftgrid .* exp.(2im * π .* t0 .* f)
@@ -245,10 +244,10 @@ function trig_sum(t::Vector{T}, h::Vector{T}, df::T, N::Int;
         #= elseif algorithm == "fasper"
             Nfft = next_fast_len(Int(N * oversampling))
             if f0 > 0
-                h = h .* exp.(2im * π * f0 .* (t .- minimum(t)))
+                y = y .* exp.(2im * π * f0 .* (x .- minimum(x)))
             end
-            tnorm = mod.((t .- minimum(t)) .* Nfft .* df, Nfft)
-            grid = extirpolate(tnorm, h, Nfft, Mfft)
+            tnorm = mod.((x .- minimum(x)) .* Nfft .* df, Nfft)
+            grid = extirpolate(tnorm, y, Nfft, Mfft)
             fftgrid = FFTW.ifft(grid) .* Nfft
             fftgrid = fftgrid[1:N]
             if t0 != 0
@@ -262,8 +261,8 @@ function trig_sum(t::Vector{T}, h::Vector{T}, df::T, N::Int;
             end =#
 
     else
-        dtmp_cos = cos.(2π * df .* t)
-        dtmp_sin = sin.(2π * df .* t)
+        dtmp_cos = cos.(2π * df .* x)
+        dtmp_sin = sin.(2π * df .* x)
 
         block_size = 512
         nblocks = cld(N, block_size)
@@ -271,8 +270,8 @@ function trig_sum(t::Vector{T}, h::Vector{T}, df::T, N::Int;
         C = zeros(T, N)
         S = zeros(T, N)
 
-        tmp_cos = Vector{T}(undef, length(t))
-        tmp_sin = Vector{T}(undef, length(t))
+        tmp_cos = Vector{T}(undef, length(x))
+        tmp_sin = Vector{T}(undef, length(x))
 
         C_tmp = zero(T)
         S_tmp = zero(T)
@@ -284,15 +283,15 @@ function trig_sum(t::Vector{T}, h::Vector{T}, df::T, N::Int;
 
             f_start = f0 + df * (block_start - 1)
 
-            tmp_cos = cos.(2π * f_start * t)
-            tmp_sin = sin.(2π * f_start * t)
+            tmp_cos = cos.(2π * f_start * x)
+            tmp_sin = sin.(2π * f_start * x)
 
             @inbounds for j in block_start:block_end
                 C_tmp = zero(T)
                 S_tmp = zero(T)
-                @inbounds @fastmath @simd for k in eachindex(t)
-                    C_tmp += h[k] * tmp_cos[k]
-                    S_tmp += h[k] * tmp_sin[k]
+                @inbounds @fastmath @simd for k in eachindex(x)
+                    C_tmp += y[k] * tmp_cos[k]
+                    S_tmp += y[k] * tmp_sin[k]
 
                     tmp = tmp_cos[k] * dtmp_cos[k] - tmp_sin[k] * dtmp_sin[k]
                     tmp_sin[k] = tmp_cos[k] * dtmp_sin[k] + tmp_sin[k] * dtmp_cos[k]
@@ -303,7 +302,7 @@ function trig_sum(t::Vector{T}, h::Vector{T}, df::T, N::Int;
             end
         end
     # the loop above is mathematically equivalent to
-    # dftgrid = [sum(h .* exp.(2π * 1im * f_j .* t)) for f_j in f]
+    # dftgrid = [sum(y .* exp.(2π * 1im * f_j .* x)) for f_j in f]
     end
     return S, C
 end
@@ -317,33 +316,32 @@ Extirpolate the values `(x, y)` onto an integer grid `0:N-1` using Lagrange
 polynomial weights on the `M` nearest points.
 """
 
-# function extirpolate(x::Vector{T}, y::Vector{T2}, N::Int, M::Int) where {T<:Real, T2<:Number}
-#     result = zeros(T2, N)
-#     # First add contributions for integer-valued x
-#     for (xi, yi) in zip(x, y)
-#         if isapprox(mod(xi,1), 0; atol=1e-12)
-#             idx = Int(round(xi)) + 1
-#             if 1 ≤ idx ≤ N
-#                 result[idx] += yi
-#             end
-#         end
-#     end
-#     # Process non-integer x
-#     for (xi, yi) in zip(x, y)
-#         if !isapprox(mod(xi,1), 0; atol=1e-12)
-#             ilo = clamp(floor(Int, xi - div(M,2)), 0, N - M)
-#             num = yi * prod(xi - (ilo + j) for j in 0:M-1)
-#             den = factorial(M - 1)
-#             for j in 0:M-1
-#                 if j > 0
-#                     den *= j / (j - M)
-#                 end
-#                 ind = ilo + (M - 1 - j)
-#                 result[ind + 1] += num / (den * (xi - ind))
-#             end
-#         end
-#     end
-#     return result
-# end
-
+function extirpolate(x::Vector{T}, y::Vector{T2}, N::Int, M::Int) where {T<:Real, T2<:Number}
+    result = zeros(T2, N)
+    # First add contributions for integer-valued x
+    for (xi, yi) in zip(x, y)
+        if isapprox(mod(xi,1), 0; atol=1e-12)
+            idx = Int(round(xi)) + 1
+            if 1 ≤ idx ≤ N
+                result[idx] += yi
+            end
+        end
+    end
+    # Process non-integer x
+    for (xi, yi) in zip(x, y)
+        if !isapprox(mod(xi,1), 0; atol=1e-12)
+            ilo = clamp(floor(Int, xi - div(M,2)), 0, N - M)
+            num = yi * prod(xi - (ilo + j) for j in 0:M-1)
+            den = factorial(M - 1)
+            for j in 0:M-1
+                if j > 0
+                    den *= j / (j - M)
+                end
+                ind = ilo + (M - 1 - j)
+                result[ind + 1] += num / (den * (xi - ind))
+            end
+        end
+    end
+    return result
+end
 =#
