@@ -24,12 +24,13 @@ Compute the fast chi² periodogram (equivalent to the Astropy Lomb–Scargle per
 A vector of periodogram power values at each frequency.
 """
 function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
-                              f0::Float64, df::Float64, Nf::Int;
-                              normalization::String="none",
-                              nterms::Int=3,
-                              use_fft::Union{Bool, Symbol} = :auto,
-                              eps::Float64=5e-13)
+                  f0::Float64, df::Float64, Nf::Int;
+                  normalization::String="none",
+                  nterms::Int=3,
+                  use_fft::Union{Bool, Symbol} = :auto,
+                  eps::Float64=5e-13)
 
+    # Input validation
     if nterms <= 0
         error("Cannot have nterms <= 0")
     end
@@ -42,15 +43,13 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
         error("t, y, and dy must all have the same length")
     end
 
+    # Weighting and data centering
     w = 1.0 ./(dy .^ 2)
     ws = sum(w)
-    if center_data || fit_mean
-        y = y .- (sum(w .* y) / ws)
-    end
-
+    y .-= (sum(w .* y) / ws)
     chi2_ref = sum((y ./ dy) .^ 2)
 
-    # Compute necessary sums
+    # Precompute trig sums. Note that trig_sum is assumed to return two vectors.
     Cw = Vector{Vector{Float64}}(undef, 2 * nterms + 1)
     Sw = Vector{Vector{Float64}}(undef, 2 * nterms + 1)
     Cyw = Vector{Vector{Float64}}(undef, nterms + 1)
@@ -68,46 +67,60 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
         Syw[i + 1], Cyw[i + 1] = trig_sum(t, w .* y, df, Nf; f0=f0, freq_factor=Float64(i), eps=eps)
     end
 
-    # Construct the order of terms
-    order = Tuple{Char, Int}[]
-    push!(order, ('C', 0))
-    @inbounds for i in 1:nterms
-        push!(order, ('S', i))
-        push!(order, ('C', i))
-    end
+    nC = nterms + 1
+    nS = nterms
+    norder = nC + nS
 
-    function compute_power(i::Int)
-        norder = length(order)
-        XTX = zeros(norder, norder)
-        XTy = zeros(norder)
+    # Preallocate buffers for the linear system.
+    XTX = zeros(norder, norder)
+    XTy = zeros(norder)
+    p = similar(zeros(Nf))
 
-        @inbounds for j in 1:norder
-            A = order[j]
-            @inbounds for k in 1:norder
-                B = order[k]
-                if A[1] == 'S' && B[1] == 'S'
-                    XTX[j, k] = 0.5 * (Cw[abs(A[2] - B[2]) + 1][i] - Cw[A[2] + B[2] + 1][i])
-                elseif A[1] == 'C' && B[1] == 'C'
-                    XTX[j, k] = 0.5 * (Cw[abs(A[2] - B[2]) + 1][i] + Cw[A[2] + B[2] + 1][i])
-                elseif A[1] == 'S' && B[1] == 'C'
-                    XTX[j, k] = 0.5 * (sign(A[2] - B[2]) * Sw[abs(A[2] - B[2]) + 1][i] + Sw[A[2] + B[2] + 1][i])
-                elseif A[1] == 'C' && B[1] == 'S'
-                    XTX[j, k] = 0.5 * (sign(B[2] - A[2]) * Sw[abs(B[2] - A[2]) + 1][i] + Sw[B[2] + A[2] + 1][i])
-                else
-                    XTX[j, k] = Cw[1][i]  # Bias term
-                end
+    # Loop over frequency grid
+    @inbounds for i in 1:Nf
+        # Fill cosine-cosine block and corresponding XTy entries.
+        @inbounds for a in 0:nterms
+            ia = a + 1
+            # The cosine block: for b from a to nterms.
+            @inbounds for b in a:nterms
+                jb = b + 1
+                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] + Cw[a + b + 1][i])
+                XTX[ia, jb] = XTX_val
+                XTX[jb, ia] = XTX_val
             end
-            if A[1] == 'S'
-                XTy[j] = Syw[A[2] + 1][i]
-            else
-                XTy[j] = Cyw[A[2] + 1][i]
+            # Fill XTy for cosine terms.
+            XTy[ia] = Cyw[a + 1][i]
+        end
+
+        # Fill sine-sine block and corresponding XTy entries.
+        @inbounds for a in 1:nterms
+            ia = nC + a
+            @inbounds for b in a:nterms
+                jb = nC + b
+                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] - Cw[a + b + 1][i])
+                XTX[ia, jb] = XTX_val
+                XTX[jb, ia] = XTX_val
+            end
+            XTy[ia] = Syw[a + 1][i]
+        end
+
+        # Fill cosine-sine cross terms.
+        @inbounds for a in 0:nterms
+            ia = a + 1
+            @inbounds for b in 1:nterms
+                jb = nC + b
+                s = b - a  # sign(s) will be -1, 0, or 1.
+                XTX_val = 0.5 * (sign(s) * Sw[abs(s) + 1][i] + Sw[a + b + 1][i])
+                XTX[ia, jb] = XTX_val
+                XTX[jb, ia] = XTX_val  # symmetry.
             end
         end
 
+        # Solve the linear system XTX * β = XTy.
+        # We assume that solve() efficiently uses a Cholesky (LLT) decomposition.
         β = solve(XTX, XTy)
-        return sum(XTy .* β)
+        p[i] = sum(XTy .* β)
     end
 
-    p = [compute_power(i) for i in 1:Nf]
     return normalization == "none" ? p ./ chi2_ref : error("Normalization '$normalization' not recognized")
 end
