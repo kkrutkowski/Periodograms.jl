@@ -1,13 +1,10 @@
 using Statistics
-using StaticArrays
 
 # Assumes the following files and the vectorized `solve` function are available.
 include("../utils/trig_sum.jl")
 include("../utils/mle.jl")
 # include("path/to/vectorized_solve.jl") # <-- Include your new solve function here
 
-# Define a type alias for an 8-element vector of Float64.
-const Vec8 = SVector{8, Float64}
 
 """
     fastchi2(t, y, dy, f0, df, Nf; ...)
@@ -68,8 +65,8 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
 
     @inbounds for i in 1:8:Nf_vec
         freq_slice = i:(i + 7)
-        XTX_vec = zeros(Vec8, norder, norder)
-        XTy_vec = zeros(Vec8, norder)
+        XTX_vec = [zeros(8) for _ in 1:norder, _ in 1:norder]
+        XTy_vec = [zeros(8) for _ in 1:norder]
 
         # Fill cosine-cosine block and corresponding XTy entries
         @inbounds for a in 0:nterms
@@ -117,7 +114,15 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
         β_vec = solve(XTX_vec, XTy_vec)
 
         # Calculate and store the power for the 8 systems
-        p[freq_slice] = sum(XTy_vec .* β_vec)
+        power_vals = zeros(8)
+        for k in 1:8
+            dot_product = 0.0
+            for j in 1:norder
+                dot_product += XTy_vec[j][k] * β_vec[j][k]
+            end
+            power_vals[k] = dot_product
+        end
+        p[freq_slice] = power_vals
     end
 
     # --- Scalar Remainder Loop ---

@@ -1,8 +1,5 @@
-using StaticArrays
-
-# Define a type alias for an 8-element vector of Float64 for clarity.
-# Operations on SVector are highly optimized and will be vectorized by the compiler.
-const Vec8 = SVector{8, Float64}
+# Define a type alias for an 8-element vector of Float64
+const Vec8 = Vector{Float64}
 
 """
     ldlt_decomposition(A)
@@ -20,28 +17,35 @@ triangular matrix and D is a diagonal matrix.
 """
 function ldlt_decomposition(A::Matrix{Vec8})
     n = size(A, 1)
-    LDL = zeros(Vec8, n, n)
+    LDL = [zeros(8) for _ in 1:n, _ in 1:n]
 
     @inbounds for i in 1:n
         # Calculate the off-diagonal elements of L for row i
         for j in 1:i-1
-            s = zero(Vec8)
+            s = zeros(8)
             for k in 1:j-1
-                # s += L[i, k] * D[k, k] * L[j, k]
-                s += LDL[i, k] * LDL[j, k] * LDL[k, k]
+                # Element-wise multiplication
+                for sys in 1:8
+                    s[sys] += LDL[i, k][sys] * LDL[j, k][sys] * LDL[k, k][sys]
+                end
             end
-            # L[i, j] = (A[i, j] - s) / D[j, j]
-            LDL[i, j] = (A[i, j] - s) / LDL[j, j]
+            # Element-wise division
+            for sys in 1:8
+                LDL[i, j][sys] = (A[i, j][sys] - s[sys]) / LDL[j, j][sys]
+            end
         end
 
         # Calculate the i-th diagonal element of D
-        s_diag = zero(Vec8)
+        s_diag = zeros(8)
         for k in 1:i-1
-            # s_diag += L[i, k]^2 * D[k, k]
-            s_diag += LDL[i, k] * LDL[i, k] * LDL[k, k]
+            for sys in 1:8
+                s_diag[sys] += LDL[i, k][sys] * LDL[i, k][sys] * LDL[k, k][sys]
+            end
         end
-        # D[i, i] = A[i, i] - s_diag
-        LDL[i, i] = A[i, i] - s_diag
+        # Element-wise subtraction
+        for sys in 1:8
+            LDL[i, i][sys] = A[i, i][sys] - s_diag[sys]
+        end
     end
 
     return LDL
@@ -55,18 +59,23 @@ decomposition.
 """
 function forward_substitution(LDL::Matrix{Vec8}, b::Vector{Vec8})
     n = length(b)
-    y = zeros(Vec8, n)
+    y = [zeros(8) for _ in 1:n]
 
     @inbounds for i in 1:n
-        s = zero(Vec8)
+        s = zeros(8)
         for j in 1:i-1
-            s += LDL[i, j] * y[j]
+            for sys in 1:8
+                s[sys] += LDL[i, j][sys] * y[j][sys]
+            end
         end
-        y[i] = b[i] - s
+        for sys in 1:8
+            y[i][sys] = b[i][sys] - s[sys]
+        end
     end
 
     return y
 end
+
 
 """
     diagonal_solve(LDL, y)
@@ -75,14 +84,17 @@ Solves D*z = y for z, where D is the diagonal matrix from the LDLT decomposition
 """
 function diagonal_solve(LDL::Matrix{Vec8}, y::Vector{Vec8})
     n = length(y)
-    z = zeros(Vec8, n)
+    z = [zeros(8) for _ in 1:n]
 
     @inbounds for i in 1:n
-        z[i] = y[i] / LDL[i, i]
+        for sys in 1:8
+            z[i][sys] = y[i][sys] / LDL[i, i][sys]
+        end
     end
 
     return z
 end
+
 
 """
     backward_substitution(LDL, z)
@@ -92,15 +104,18 @@ from the LDLT decomposition.
 """
 function backward_substitution(LDL::Matrix{Vec8}, z::Vector{Vec8})
     n = length(z)
-    x = zeros(Vec8, n)
+    x = [zeros(8) for _ in 1:n]
 
     @inbounds for i in n:-1:1
-        s = zero(Vec8)
+        s = zeros(8)
         for j in i+1:n
-            # This uses L[j, i], which corresponds to (L')_{i,j}
-            s += LDL[j, i] * x[j]
+            for sys in 1:8
+                s[sys] += LDL[j, i][sys] * x[j][sys]
+            end
         end
-        x[i] = z[i] - s
+        for sys in 1:8
+            x[i][sys] = z[i][sys] - s[sys]
+        end
     end
 
     return x
@@ -123,7 +138,7 @@ provided.
 - `x::Vector{SVector{8, Float64}}`: The solution vector, where each element is
   an 8-element vector representing the 8 solutions.
 """
-function solve(A::Matrix{SVector{8, Float64}}, b::Vector{SVector{8, Float64}})
+function solve(A::Matrix{Vec8}, b::Vector{Vec8})
     # Step 1: Perform LDLT decomposition: A = L*D*L'
     LDL = ldlt_decomposition(A)
 
