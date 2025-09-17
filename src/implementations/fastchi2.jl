@@ -1,27 +1,19 @@
 using Statistics
+using StaticArrays
 
+# Assumes the following files and the vectorized `solve` function are available.
 include("../utils/trig_sum.jl")
 include("../utils/mle.jl")
+# include("path/to/vectorized_solve.jl") # <-- Include your new solve function here
 
+# Define a type alias for an 8-element vector of Float64.
+const Vec8 = SVector{8, Float64}
 
 """
-    fastchi2(t, y, dy, f0, df, Nf;
-                         normalization="standard",
-                         nterms=1, use_fft=true,
-                         eps=5e-13)
+    fastchi2(t, y, dy, f0, df, Nf; ...)
 
-Compute the fast chi² periodogram (equivalent to the Astropy Lomb–Scargle periodogram).
-
-# Arguments
-- `t`, `y`, `dy` : vectors of observation times, data values, and errors.
-- `f0`, `df`, `Nf` : frequency grid parameters. Frequencies are given by
-  `f = f0 + df * (0:Nf-1)`.
-- `normalization` : one of `"standard"`, `"none"`.
-- `nterms` : number of Fourier terms in the fit.
-- `use_fft` : if true, use the FFT-based method in `trig_sum`.
-
-# Returns
-A vector of periodogram power values at each frequency.
+Compute the fast chi² periodogram, solving 8 frequencies at a time.
+(Function signature and arguments remain unchanged).
 """
 function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
                   f0::Float64, df::Float64, Nf::Int;
@@ -30,26 +22,24 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
                   use_fft::Union{Bool, Symbol} = :auto,
                   eps::Float64=5e-13)
 
-    # Input validation
+    # --- Input validation and setup (unchanged) ---
     if nterms <= 0
         error("Cannot have nterms <= 0")
     end
     if f0 < 0 || df <= 0 || Nf <= 0
         error("Invalid frequency parameters")
     end
-
     N = length(t)
     if length(y) != N || length(dy) != N
         error("t, y, and dy must all have the same length")
     end
 
-    # Weighting and data centering
     w = 1.0 ./(dy .^ 2)
     ws = sum(w)
     y .-= (sum(w .* y) / ws)
     chi2_ref = sum((y ./ dy) .^ 2)
 
-    # Precompute trig sums. Note that trig_sum is assumed to return two vectors.
+    # --- Precompute trig sums (unchanged) ---
     Cw = Vector{Vector{Float64}}(undef, 2 * nterms + 1)
     Sw = Vector{Vector{Float64}}(undef, 2 * nterms + 1)
     Cyw = Vector{Vector{Float64}}(undef, nterms + 1)
@@ -70,57 +60,103 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
     nC = nterms + 1
     nS = nterms
     norder = nC + nS
+    p = zeros(Nf)
 
-    # Preallocate buffers for the linear system.
-    XTX = zeros(norder, norder)
-    XTy = zeros(norder)
-    p = similar(zeros(Nf))
+    # --- Vectorized Main Loop ---
+    # Process frequencies in vectorized chunks of 8.
+    Nf_vec = Nf - (Nf % 8)
 
-    # Loop over frequency grid
-    @inbounds for i in 1:Nf
-        # Fill cosine-cosine block and corresponding XTy entries.
+    @inbounds for i in 1:8:Nf_vec
+        freq_slice = i:(i + 7)
+        XTX_vec = zeros(Vec8, norder, norder)
+        XTy_vec = zeros(Vec8, norder)
+
+        # Fill cosine-cosine block and corresponding XTy entries
         @inbounds for a in 0:nterms
             ia = a + 1
-            # The cosine block: for b from a to nterms.
             @inbounds for b in a:nterms
                 jb = b + 1
-                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] + Cw[a + b + 1][i])
-                XTX[ia, jb] = XTX_val
-                XTX[jb, ia] = XTX_val
+                c1 = Vec8(@view Cw[abs(a - b) + 1][freq_slice])
+                c2 = Vec8(@view Cw[a + b + 1][freq_slice])
+                XTX_val_vec = 0.5 * (c1 + c2)
+                XTX_vec[ia, jb] = XTX_val_vec
+                XTX_vec[jb, ia] = XTX_val_vec
             end
-            # Fill XTy for cosine terms.
-            XTy[ia] = Cyw[a + 1][i]
+            XTy_vec[ia] = Vec8(@view Cyw[a + 1][freq_slice])
         end
 
-        # Fill sine-sine block and corresponding XTy entries.
+        # Fill sine-sine block and corresponding XTy entries
         @inbounds for a in 1:nterms
             ia = nC + a
             @inbounds for b in a:nterms
                 jb = nC + b
-                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] - Cw[a + b + 1][i])
-                XTX[ia, jb] = XTX_val
-                XTX[jb, ia] = XTX_val
+                c1 = Vec8(@view Cw[abs(a - b) + 1][freq_slice])
+                c2 = Vec8(@view Cw[a + b + 1][freq_slice])
+                XTX_val_vec = 0.5 * (c1 - c2)
+                XTX_vec[ia, jb] = XTX_val_vec
+                XTX_vec[jb, ia] = XTX_val_vec
             end
-            XTy[ia] = Syw[a + 1][i]
+            XTy_vec[ia] = Vec8(@view Syw[a + 1][freq_slice])
         end
 
-        # Fill cosine-sine cross terms.
+        # Fill cosine-sine cross terms
         @inbounds for a in 0:nterms
             ia = a + 1
             @inbounds for b in 1:nterms
                 jb = nC + b
-                s = b - a  # sign(s) will be -1, 0, or 1.
-                XTX_val = 0.5 * (sign(s) * Sw[abs(s) + 1][i] + Sw[a + b + 1][i])
-                XTX[ia, jb] = XTX_val
-                XTX[jb, ia] = XTX_val  # symmetry.
+                s = b - a
+                s1 = Vec8(@view Sw[abs(s) + 1][freq_slice])
+                s2 = Vec8(@view Sw[a + b + 1][freq_slice])
+                XTX_val_vec = 0.5 * (sign(s) * s1 + s2)
+                XTX_vec[ia, jb] = XTX_val_vec
+                XTX_vec[jb, ia] = XTX_val_vec
             end
         end
 
-        # Solve the linear system XTX * β = XTy.
-        # We assume that solve() efficiently uses a Cholesky (LLT) decomposition.
-        β = solve(XTX, XTy)
-        p[i] = sum(XTy .* β)
+        # Solve the 8 linear systems simultaneously
+        β_vec = solve(XTX_vec, XTy_vec)
+
+        # Calculate and store the power for the 8 systems
+        p[freq_slice] = sum(XTy_vec .* β_vec)
     end
 
+    # --- Scalar Remainder Loop ---
+    # Process any remaining frequencies one-by-one.
+    if Nf_vec < Nf
+        XTX = zeros(norder, norder)
+        XTy = zeros(norder)
+        @inbounds for i in (Nf_vec + 1):Nf
+            # Fill cosine-cosine block
+            @inbounds for a in 0:nterms, b in a:nterms
+                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] + Cw[a + b + 1][i])
+                XTX[a + 1, b + 1] = XTX[b + 1, a + 1] = XTX_val
+            end
+            @inbounds for a in 0:nterms
+                XTy[a + 1] = Cyw[a + 1][i]
+            end
+
+            # Fill sine-sine block
+            @inbounds for a in 1:nterms, b in a:nterms
+                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] - Cw[a + b + 1][i])
+                XTX[nC + a, nC + b] = XTX[nC + b, nC + a] = XTX_val
+            end
+            @inbounds for a in 1:nterms
+                XTy[nC + a] = Syw[a + 1][i]
+            end
+
+            # Fill cosine-sine cross terms
+            @inbounds for a in 0:nterms, b in 1:nterms
+                s = b - a
+                XTX_val = 0.5 * (sign(s) * Sw[abs(s) + 1][i] + Sw[a + b + 1][i])
+                XTX[a + 1, nC + b] = XTX[nC + b, a + 1] = XTX_val
+            end
+
+            # Solve the single linear system
+            β = XTX \ XTy
+            p[i] = sum(XTy .* β)
+        end
+    end
+
+    # --- Normalization and return (unchanged) ---
     return normalization == "none" ? p ./ chi2_ref : error("Normalization '$normalization' not recognized")
 end
