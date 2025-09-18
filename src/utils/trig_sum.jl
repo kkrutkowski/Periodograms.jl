@@ -1,6 +1,4 @@
 using FFTW
-# using LoopVectorization
-# using StructArrays
 
 # --- FFT Grid Helpers ---
 
@@ -62,7 +60,7 @@ function jn(n::Int, x::Real; num_terms::Int=10)
     end
     result = 0.0
     term_numer = half_x^n
-    @inbounds for k in 0:(num_terms - 1)
+    @inbounds @simd for k in 0:(num_terms - 1)
         term_denom = fact[k+1] * fact[n + k + 1]
         result += term_numer / term_denom
         term_numer *= -half_x^2
@@ -135,6 +133,8 @@ function get_lra_params(x::AbstractVector{T}, N::Int, ϵ::T) where T<:Real
     return s, γ, K
 end
 
+# --- Modified construct_UV function ---
+
 """
     construct_UV(x, γ, K, N)
 
@@ -143,17 +143,58 @@ kernel is approximated by `U * Vᴴ`.
 """
 function construct_UV(x::AbstractVector{T}, γ::T, K::Int, N::Int) where T<:Real
     M = length(x)
-    er = mod.(N .* x - round.(N .* x) .+ 0.5, 1) .- 0.5
-    Tcheb_U = γ == zero(T) ? ones(T, M, K) : chebyshev_polynomials(K-1, er ./ γ)
+
+    # Calculate `er` with a loop
+    er = zeros(T, M)
+    @inbounds @simd for i in 1:M
+        val = N * x[i]
+        er[i] = mod(val - round(val) + 0.5, 1) - 0.5
+    end
+
+    # Calculate Chebyshev polynomials for U
+    Tcheb_U_real = if γ == zero(T)
+        ones(T, M, K)
+    else
+        scaled_er = zeros(T, M)
+        @inbounds @simd for i in 1:M
+            scaled_er[i] = er[i] / γ
+        end
+        chebyshev_polynomials(K-1, scaled_er)
+    end
+
     B = bessel_coefficients(K, γ)
-    U = exp.(-1im * π .* er) .* (Tcheb_U * B)
-    ω = 0:N-1
-    X = 2.0 .* ω ./ N .- 1.0
-    V = complex.(chebyshev_polynomials(K-1, X))
+    temp_U_mat = Tcheb_U_real * B
+
+    # Calculate U with loops
+    U = zeros(Complex{T}, M, K)
+    @inbounds @simd for i in 1:M
+        phase_factor = exp(-1im * π * er[i])
+        @inbounds @simd for k in 1:K
+            U[i, k] = phase_factor * temp_U_mat[i, k]
+        end
+    end
+
+    # Calculate X for V's Chebyshev polynomials
+    X = zeros(T, N)
+    @inbounds @simd for i in 1:N
+        ω = i - 1
+        X[i] = 2.0 * ω / N - 1.0
+    end
+
+    Tcheb_V_real = chebyshev_polynomials(K-1, X)
+
+    # Construct complex V from real Chebyshev matrix
+    V = zeros(Complex{T}, N, K)
+    @inbounds @simd for k in 1:K
+        @inbounds @simd for i in 1:N
+             V[i, k] = Tcheb_V_real[i, k]
+        end
+    end
+
     return U, V
 end
 
-# --- NUFFT Type-I via Low Rank Approximation ---
+# --- Modified nufft1_lra functions ---
 
 """
     nufft1_lra(x, y, N, ϵ)
@@ -161,21 +202,39 @@ end
 Compute the adjoint (Type-I) NUFFT using a low-rank approximation.
 For nonuniform locations `x` (typically in [0,1)) and complex amplitudes `y`, computes
 
-    s[k] = ∑ⱼ y[j] exp(2πi x[j]*(k-1))   for k = 1,…,N.
+    s[k] = ∑ⱼ y[j] exp(2πi x[j]*(k-1))    for k = 1,…,N.
 """
 function nufft1_lra(x::AbstractVector{T}, y::AbstractVector{T}, N::Int, ϵ::T) where T<:Real
     M = length(x)
     Nfft = next_fast_len(max(N, M))
     s_indices, γ, K = get_lra_params(x, Nfft, ϵ)
     U, V = construct_UV(x, γ, K, Nfft)
+
     temp = zeros(Complex{T}, Nfft, K)
     @inbounds for i in 1:M
+        yi = y[i]
+        si = s_indices[i]
         @inbounds for k in 1:K
-            temp[s_indices[i], k] += conj(U[i, k]) * y[i]
+            temp[si, k] += conj(U[i, k]) * yi
         end
     end
-    temp_ifft = FFTW.ifft(temp, 1) .* Nfft
-    s = vec(sum(conj.(V) .* temp_ifft, dims=2))
+
+    temp_ifft = FFTW.ifft(temp, 1)
+    # Scale result of IFFT with a loop
+    @inbounds for i in eachindex(temp_ifft)
+        temp_ifft[i] *= Nfft
+    end
+
+    # Compute dot product sum with a loop
+    s = zeros(Complex{T}, Nfft)
+    @inbounds for i in 1:Nfft
+        row_sum = zero(Complex{T})
+        @inbounds for k in 1:K
+            row_sum += conj(V[i, k]) * temp_ifft[i, k]
+        end
+        s[i] = row_sum
+    end
+
     return s[1:N]
 end
 
@@ -184,14 +243,32 @@ function nufft1_lra(x::AbstractVector{T}, y::AbstractVector{Complex{T}}, N::Int,
     Nfft = next_fast_len(max(N, M))
     s_indices, γ, K = get_lra_params(x, Nfft, ϵ)
     U, V = construct_UV(x, γ, K, Nfft)
+
     temp = zeros(Complex{T}, Nfft, K)
     @inbounds for i in 1:M
+        yi = y[i]
+        si = s_indices[i]
         @inbounds for k in 1:K
-            temp[s_indices[i], k] += conj(U[i, k]) * y[i]
+            temp[si, k] += conj(U[i, k]) * yi
         end
     end
-    temp_ifft = FFTW.ifft(temp, 1) .* Nfft
-    s = vec(sum(conj.(V) .* temp_ifft, dims=2))
+
+    temp_ifft = FFTW.ifft(temp, 1)
+    # Scale result of IFFT with a loop
+    @inbounds for i in eachindex(temp_ifft)
+        temp_ifft[i] *= Nfft
+    end
+
+    # Compute dot product sum with a loop
+    s = zeros(Complex{T}, Nfft)
+    @inbounds for i in 1:Nfft
+        row_sum = zero(Complex{T})
+        @inbounds for k in 1:K
+            row_sum += conj(V[i, k]) * temp_ifft[i, k]
+        end
+        s[i] = row_sum
+    end
+
     return s[1:N]
 end
 
