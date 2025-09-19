@@ -125,43 +125,6 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
         p[freq_slice] = power_vals
     end
 
-    # --- Scalar Remainder Loop ---
-    # Process any remaining frequencies one-by-one.
-    if Nf_vec < Nf
-        XTX = zeros(norder, norder)
-        XTy = zeros(norder)
-        @inbounds for i in (Nf_vec + 1):Nf
-            # Fill cosine-cosine block
-            @inbounds for a in 0:nterms, b in a:nterms
-                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] + Cw[a + b + 1][i])
-                XTX[a + 1, b + 1] = XTX[b + 1, a + 1] = XTX_val
-            end
-            @inbounds for a in 0:nterms
-                XTy[a + 1] = Cyw[a + 1][i]
-            end
-
-            # Fill sine-sine block
-            @inbounds for a in 1:nterms, b in a:nterms
-                XTX_val = 0.5 * (Cw[abs(a - b) + 1][i] - Cw[a + b + 1][i])
-                XTX[nC + a, nC + b] = XTX[nC + b, nC + a] = XTX_val
-            end
-            @inbounds for a in 1:nterms
-                XTy[nC + a] = Syw[a + 1][i]
-            end
-
-            # Fill cosine-sine cross terms
-            @inbounds for a in 0:nterms, b in 1:nterms
-                s = b - a
-                XTX_val = 0.5 * (sign(s) * Sw[abs(s) + 1][i] + Sw[a + b + 1][i])
-                XTX[a + 1, nC + b] = XTX[nC + b, a + 1] = XTX_val
-            end
-
-            # Solve the single linear system
-            β = XTX \ XTy
-            p[i] = sum(XTy .* β)
-        end
-    end
-
     # --- Normalization and return (unchanged) ---
     return normalization == "none" ? p ./ chi2_ref : error("Normalization '$normalization' not recognized")
 end
