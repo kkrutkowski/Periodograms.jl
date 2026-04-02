@@ -1,42 +1,36 @@
+using LinearAlgebra
 using Statistics
 
-# Assumes the following files and the vectorized `solve` function are available.
-include("../utils/trig_sum.jl")
-include("../utils/mle.jl")
-# include("path/to/vectorized_solve.jl") # <-- Include your new solve function here
+include("./trig_sum.jl")
+include("./mle.jl")
 
+# Ensure the type alias from the previous step is available
+const CVec8 = Vector{ComplexF64}
 
 """
-    fastchi2(t, y, dy, f0, df, Nf; ...)
+fastchi2(t, y, dy, f0, df, Nf; ...)
 
-Compute the fast chi² periodogram, solving 8 frequencies at a time.
-(Function signature and arguments remain unchanged).
+Compute the fast chi² periodogram using a pure Complex Toeplitz formulation.
 """
 function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
-                  f0::Float64, df::Float64, Nf::Int;
-                  normalization::String="none",
-                  nterms::Int=3,
-                  use_fft::Union{Bool, Symbol} = :auto,
-                  eps::Float64=5e-13)
+                          f0::Float64, df::Float64, Nf::Int;
+                          normalization::String="none",
+                          nterms::Int=3,
+                          eps::Float64=5e-13)
 
-    # --- Input validation and setup (unchanged) ---
-    if nterms <= 0
-        error("Cannot have nterms <= 0")
-    end
-    if f0 < 0 || df <= 0 || Nf <= 0
-        error("Invalid frequency parameters")
-    end
+    if nterms <= 0 error("Cannot have nterms <= 0") end
+    if f0 < 0 || df <= 0 || Nf <= 0 error("Invalid frequency parameters") end
+
     N = length(t)
-    if length(y) != N || length(dy) != N
-        error("t, y, and dy must all have the same length")
-    end
+    if length(y) != N || length(dy) != N error("Lengths of t, y, dy must match") end
 
-    w = 1.0 ./(dy .^ 2)
+    # Weight setup
+    w = 1.0 ./ (dy .^ 2)
     ws = sum(w)
     y .-= (sum(w .* y) / ws)
     chi2_ref = sum((y ./ dy) .^ 2)
 
-    # --- Precompute trig sums (unchanged) ---
+    # Precompute trig sums
     Cw = Vector{Vector{Float64}}(undef, 2 * nterms + 1)
     Sw = Vector{Vector{Float64}}(undef, 2 * nterms + 1)
     Cyw = Vector{Vector{Float64}}(undef, nterms + 1)
@@ -54,77 +48,54 @@ function fastchi2(t::Vector{Float64}, y::Vector{Float64}, dy::Vector{Float64},
         Syw[i + 1], Cyw[i + 1] = trig_sum(t, w .* y, df, Nf; f0=f0, freq_factor=Float64(i), eps=eps)
     end
 
-    nC = nterms + 1
-    nS = nterms
-    norder = nC + nS
-    p = zeros(Nf)
+    norder = 2 * nterms + 1
+    p = zeros(Float64, Nf)
 
-    # --- Vectorized Main Loop ---
-    # Process frequencies in vectorized chunks of 8.
-    Nf_vec = Nf - (Nf % 8)
+    # --- Batched Levinson Workspace ---
+    R_batch      = [zeros(ComplexF64, 8) for _ in 1:norder]
+    Y_batch      = [zeros(ComplexF64, 8) for _ in 1:norder]
+    beta_batch   = [zeros(ComplexF64, 8) for _ in 1:norder]
+    a_batch      = [zeros(ComplexF64, 8) for _ in 1:norder]
+    a_prev_batch = [zeros(ComplexF64, 8) for _ in 1:norder]
 
-    @inbounds for i in 1:8:Nf_vec
-        freq_slice = i:(i + 7)
-        XTX_vec = [zeros(8) for _ in 1:norder, _ in 1:norder]
-        XTy_vec = [zeros(8) for _ in 1:norder]
+    # Loop over frequencies in chunks of 8
+    @inbounds for freq_base in 1:8:Nf
 
-        # Fill cosine-cosine block and corresponding XTy entries
-        @inbounds for a in 0:nterms
-            ia = a + 1
-            @inbounds for b in a:nterms
-                jb = b + 1
-                c1 = Vec8(@view Cw[abs(a - b) + 1][freq_slice])
-                c2 = Vec8(@view Cw[a + b + 1][freq_slice])
-                XTX_val_vec = 0.5 * (c1 + c2)
-                XTX_vec[ia, jb] = XTX_val_vec
-                XTX_vec[jb, ia] = XTX_val_vec
-            end
-            XTy_vec[ia] = Vec8(@view Cyw[a + 1][freq_slice])
-        end
+        # Fill the batch (1 to 8 systems)
+        for sys in 1:8
+            freq_idx = freq_base + sys - 1
+            # Boundary handling: if we overshoot Nf, duplicate the last valid frequency
+            valid_idx = freq_idx <= Nf ? freq_idx : Nf
 
-        # Fill sine-sine block and corresponding XTy entries
-        @inbounds for a in 1:nterms
-            ia = nC + a
-            @inbounds for b in a:nterms
-                jb = nC + b
-                c1 = Vec8(@view Cw[abs(a - b) + 1][freq_slice])
-                c2 = Vec8(@view Cw[a + b + 1][freq_slice])
-                XTX_val_vec = 0.5 * (c1 - c2)
-                XTX_vec[ia, jb] = XTX_val_vec
-                XTX_vec[jb, ia] = XTX_val_vec
-            end
-            XTy_vec[ia] = Vec8(@view Syw[a + 1][freq_slice])
-        end
+            for k in 1:norder
+                R_batch[k][sys] = Cw[k][valid_idx] - im * Sw[k][valid_idx]
 
-        # Fill cosine-sine cross terms
-        @inbounds for a in 0:nterms
-            ia = a + 1
-            @inbounds for b in 1:nterms
-                jb = nC + b
-                s = b - a
-                s1 = Vec8(@view Sw[abs(s) + 1][freq_slice])
-                s2 = Vec8(@view Sw[a + b + 1][freq_slice])
-                XTX_val_vec = 0.5 * (sign(s) * s1 + s2)
-                XTX_vec[ia, jb] = XTX_val_vec
-                XTX_vec[jb, ia] = XTX_val_vec
+                h = k - nterms - 1
+                if h == 0
+                    Y_batch[k][sys] = Cyw[1][valid_idx] + im * 0.0
+                elseif h > 0
+                    Y_batch[k][sys] = Cyw[h + 1][valid_idx] - im * Syw[h + 1][valid_idx]
+                else
+                    Y_batch[k][sys] = Cyw[abs(h) + 1][valid_idx] + im * Syw[abs(h) + 1][valid_idx]
+                end
             end
         end
 
-        # Solve the 8 linear systems simultaneously
-        β_vec = solve(XTX_vec, XTy_vec)
+        # Solve the 8 systems simultaneously using the vectorized Levinson-Durbin
+        solve_levinson!(beta_batch, R_batch, Y_batch, a_batch, a_prev_batch)
 
-        # Calculate and store the power for the 8 systems
-        power_vals = zeros(8)
-        for k in 1:8
-            dot_product = 0.0
-            for j in 1:norder
-                dot_product += XTy_vec[j][k] * β_vec[j][k]
+        # Extract the power
+        for sys in 1:8
+            freq_idx = freq_base + sys - 1
+            if freq_idx <= Nf
+                dot_product = zero(ComplexF64)
+                for k in 1:norder
+                    dot_product += conj(beta_batch[k][sys]) * Y_batch[k][sys]
+                end
+                p[freq_idx] = real(dot_product)
             end
-            power_vals[k] = dot_product
         end
-        p[freq_slice] = power_vals
     end
 
-    # --- Normalization and return (unchanged) ---
-    return normalization == "none" ? p ./ chi2_ref : error("Normalization '$normalization' not recognized")
+return normalization == "none" ? p ./ chi2_ref : error("Normalization '$normalization' not recognized")
 end
